@@ -1,198 +1,208 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Clinic appointments</title>
-<style>
-  :root { --bg:#f6f7f9; --card:#fff; --text:#1c2330; --muted:#667085; --line:#e3e6eb; --accent:#0b6e4f; --danger:#b42318; }
-  @media (prefers-color-scheme: dark) {
-    :root { --bg:#12161c; --card:#1b212a; --text:#e8ecf2; --muted:#9aa4b2; --line:#2b3340; --accent:#3ecf8e; --danger:#ff8a80; }
-  }
-  * { box-sizing: border-box; }
-  body { margin:0; font-family: system-ui, -apple-system, "Segoe UI", sans-serif; background:var(--bg); color:var(--text); }
-  main { max-width: 720px; margin: 0 auto; padding: 24px 16px 64px; }
-  h1 { font-size: 1.5rem; margin: 0 0 4px; }
-  h2 { font-size: 1.1rem; margin: 0 0 12px; }
-  p.sub { color: var(--muted); margin: 0 0 24px; }
-  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 16px; margin-bottom: 16px; }
-  .slot { display:flex; justify-content:space-between; align-items:center; gap:12px; padding:12px 0; border-top:1px solid var(--line); }
-  .slot:first-child { border-top: 0; }
-  .slot .when { font-weight: 600; }
-  .slot .who { color: var(--muted); font-size: .9rem; }
-  .taken { color: var(--muted); font-size: .9rem; }
-  button { font: inherit; cursor: pointer; border: 0; border-radius: 8px; padding: 8px 14px; background: var(--accent); color: #fff; }
-  button.secondary { background: transparent; color: var(--text); border: 1px solid var(--line); }
-  button:disabled { opacity: .6; cursor: not-allowed; }
-  label { display:block; font-size:.9rem; margin: 10px 0 4px; }
-  input { font: inherit; width:100%; padding:9px 10px; border:1px solid var(--line); border-radius:8px; background:var(--bg); color:var(--text); }
-  .row { display:flex; gap:8px; margin-top:14px; }
-  .error { color: var(--danger); margin-top: 10px; }
-  .ok { border-color: var(--accent); }
-  dl { margin: 8px 0 0; display:grid; grid-template-columns: max-content 1fr; gap: 4px 14px; }
-  dt { color: var(--muted); }
-  dd { margin: 0; word-break: break-all; }
-  [hidden] { display: none !important; }
-</style>
-</head>
-<body>
-<main>
-  <h1>Book an appointment</h1>
-  <p class="sub">Pick an available slot, enter your details, and confirm. Times are shown in your local time.</p>
+"""Clinic booking API - Levels 1-2.
 
-  <section class="card">
-    <h2>Available slots</h2>
-    <div id="slots" aria-live="polite">Loading…</div>
-  </section>
+Endpoints (see koyaacademy.com/assessment-api):
+  POST /reset          replace all slots, delete all bookings
+  GET  /slots          list slots (optional ?provider=...)
+  POST /bookings       book a slot
+  GET  /bookings/{id}  look up a booking
+"""
+import hmac
+import json
+import os
+import re
+import threading
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
 
-  <section class="card" id="form-card" hidden>
-    <h2>Your details</h2>
-    <div id="chosen"></div>
-    <label for="name">Full name</label>
-    <input id="name" autocomplete="name">
-    <label for="email">Email</label>
-    <input id="email" type="email" autocomplete="email">
-    <div class="row">
-      <button id="book">Confirm booking</button>
-      <button id="cancel-form" class="secondary">Cancel</button>
-    </div>
-    <div id="form-error" class="error" role="alert"></div>
-  </section>
+from fastapi import Depends, FastAPI, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.security import APIKeyHeader
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
-  <section class="card ok" id="confirmation" hidden>
-    <h2>Booking confirmed</h2>
-    <dl id="conf-details"></dl>
-  </section>
-</main>
+# ---------------------------------------------------------------- auth (Level 2)
+# Set API_KEY as an environment variable on Render. The default is for local testing only.
+API_KEY = os.environ.get("API_KEY", "dev-key")
+api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
-<script>
-  // Level 2 will fill this in. Every request already sends the header via headers().
-  const API_KEY = "";
 
-  function headers(extra) {
-    const h = { "Content-Type": "application/json", ...(extra || {}) };
-    if (API_KEY) h["X-API-Key"] = API_KEY;
-    return h;
-  }
+def require_key(request: Request, key: str = Depends(api_key_header)):
+    """Reject any request without the right X-API-Key (the web page itself is exempt)."""
+    if request.url.path == "/":
+        return
+    if not key or not hmac.compare_digest(key.encode(), API_KEY.encode()):
+        raise StarletteHTTPException(401, "missing or invalid API key")
 
-  const slotsEl = document.getElementById("slots");
-  const formCard = document.getElementById("form-card");
-  const chosenEl = document.getElementById("chosen");
-  const nameEl = document.getElementById("name");
-  const emailEl = document.getElementById("email");
-  const bookBtn = document.getElementById("book");
-  const formError = document.getElementById("form-error");
-  const confirmation = document.getElementById("confirmation");
-  const confDetails = document.getElementById("conf-details");
 
-  let selected = null;
+app = FastAPI(title="Clinic booking API", dependencies=[Depends(require_key)])
 
-  function fmt(iso) {
-    const d = new Date(iso);
-    return isNaN(d) ? String(iso) : d.toLocaleString([], { dateStyle: "medium", timeStyle: "short" });
-  }
+# The web page lives on a different URL, so the browser needs CORS headers.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["Retry-After"],
+)
 
-  async function loadSlots() {
-    try {
-      const res = await fetch("/slots", { headers: headers() });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || "Could not load slots");
-      renderSlots(data.slots);
-    } catch (e) {
-      slotsEl.textContent = e.message;
+# ---------------------------------------------------------------- storage
+# In-memory for now. We move this to a database at Level 3.
+LOCK = threading.Lock()
+SLOTS = {}     # slot id -> {"id", "provider", "start", "end"}
+BOOKINGS = {}  # booking id -> booking dict
+
+
+# ---------------------------------------------------------------- helpers
+def error(status, message, headers=None):
+    return JSONResponse({"error": message}, status_code=status, headers=headers)
+
+
+def now_iso():
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def parse_dt(value):
+    """Parse an ISO timestamp to an aware UTC datetime (for sorting)."""
+    try:
+        dt = datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except (ValueError, TypeError):
+        return datetime.max.replace(tzinfo=timezone.utc)
+
+
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+def is_booked(slot_id):
+    return any(
+        b["slot_id"] == slot_id and b["status"] == "confirmed"
+        for b in BOOKINGS.values()
+    )
+
+
+async def read_json(request: Request):
+    """Return the parsed JSON body, or None if it isn't a JSON object."""
+    try:
+        body = await request.json()
+    except Exception:
+        return None
+    return body if isinstance(body, dict) else None
+
+
+# ---------------------------------------------------------------- errors
+# Every error must look like {"error": "<message>"}.
+@app.exception_handler(StarletteHTTPException)
+async def http_error(request, exc):
+    return error(exc.status_code, str(exc.detail))
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_error(request, exc):
+    return error(400, "invalid request")
+
+
+# ---------------------------------------------------------------- routes
+# We read request bodies by hand (so we control the error messages), which means
+# FastAPI can't see them. These tell the /docs test page to show a body box.
+def body_doc(example):
+    return {
+        "requestBody": {
+            "required": True,
+            "content": {"application/json": {"schema": {"type": "object"}, "example": example}},
+        }
     }
-  }
 
-  function renderSlots(slots) {
-    slotsEl.textContent = "";
-    if (!slots.length) { slotsEl.textContent = "No slots available right now."; return; }
-    for (const s of slots) {
-      const row = document.createElement("div");
-      row.className = "slot";
-      const info = document.createElement("div");
-      const when = document.createElement("div");
-      when.className = "when";
-      when.textContent = fmt(s.start) + " – " + new Date(s.end).toLocaleTimeString([], { timeStyle: "short" });
-      const who = document.createElement("div");
-      who.className = "who";
-      who.textContent = s.provider;
-      info.append(when, who);
-      row.append(info);
-      if (s.available) {
-        const btn = document.createElement("button");
-        btn.textContent = "Book";
-        btn.addEventListener("click", () => choose(s));
-        row.append(btn);
-      } else {
-        const t = document.createElement("span");
-        t.className = "taken";
-        t.textContent = "Taken";
-        row.append(t);
-      }
-      slotsEl.append(row);
-    }
-  }
 
-  function choose(slot) {
-    selected = slot;
-    confirmation.hidden = true;
-    formError.textContent = "";
-    chosenEl.textContent = slot.provider + " · " + fmt(slot.start);
-    formCard.hidden = false;
-    nameEl.focus();
-  }
+RESET_DOC = body_doc({"slots": [
+    {"id": "s1", "provider": "Dr Ade", "start": "2026-12-10T09:00:00Z", "end": "2026-12-10T09:30:00Z"},
+    {"id": "s2", "provider": "Dr Bisi", "start": "2026-12-10T08:00:00Z", "end": "2026-12-10T08:30:00Z"},
+]})
+BOOKING_DOC = body_doc({"slot_id": "s1", "name": "Ada Obi", "email": "ada@example.com"})
 
-  document.getElementById("cancel-form").addEventListener("click", () => {
-    formCard.hidden = true;
-    selected = null;
-  });
 
-  bookBtn.addEventListener("click", async () => {
-    formError.textContent = "";
-    const name = nameEl.value.trim();
-    const email = emailEl.value.trim();
-    if (!name || !email) { formError.textContent = "Please enter your name and email."; return; }
-    bookBtn.disabled = true;
-    try {
-      const res = await fetch("/bookings", {
-        method: "POST",
-        headers: headers(),
-        body: JSON.stringify({ slot_id: selected.id, name, email }),
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || "Booking failed");
-      showConfirmation(data);
-      formCard.hidden = true;
-      nameEl.value = "";
-      emailEl.value = "";
-      loadSlots();
-    } catch (e) {
-      formError.textContent = e.message;
-    } finally {
-      bookBtn.disabled = false;
-    }
-  });
+@app.post("/reset", openapi_extra=RESET_DOC)
+async def reset(request: Request):
+    body = await read_json(request)
+    if body is None or not isinstance(body.get("slots"), list):
+        return error(400, "body must be an object with a 'slots' list")
 
-  function showConfirmation(b) {
-    confDetails.textContent = "";
-    const rows = [
-      ["Booking ID", b.id],
-      ["Status", b.status],
-      ["Name", b.name],
-      ["Email", b.email],
-      ["Slot", b.slot_id],
-      ["Booked at", fmt(b.created_at)],
-    ];
-    for (const [k, v] of rows) {
-      const dt = document.createElement("dt"); dt.textContent = k;
-      const dd = document.createElement("dd"); dd.textContent = v;
-      confDetails.append(dt, dd);
-    }
-    confirmation.hidden = false;
-    confirmation.scrollIntoView({ behavior: "smooth" });
-  }
+    new_slots = {}
+    for s in body["slots"]:
+        if not isinstance(s, dict) or not s.get("id"):
+            return error(400, "each slot needs an id")
+        new_slots[str(s["id"])] = {
+            "id": str(s["id"]),
+            "provider": s.get("provider"),
+            "start": s.get("start"),
+            "end": s.get("end"),
+        }
 
-  loadSlots();
-</script>
-</body>
-</html>
+    with LOCK:
+        SLOTS.clear()
+        SLOTS.update(new_slots)
+        BOOKINGS.clear()
+    return {"status": "ok"}
+
+
+@app.get("/slots")
+async def list_slots(provider: str = None):
+    with LOCK:
+        slots = [
+            {**s, "available": not is_booked(s["id"])}
+            for s in SLOTS.values()
+            if provider is None or s["provider"] == provider
+        ]
+    slots.sort(key=lambda s: parse_dt(s["start"]))
+    return {"slots": slots}
+
+
+@app.post("/bookings", openapi_extra=BOOKING_DOC)
+async def create_booking(request: Request):
+    body = await read_json(request)
+    if body is None:
+        return error(400, "body must be a JSON object")
+
+    slot_id = body.get("slot_id")
+    name = body.get("name")
+    email = body.get("email")
+    if not all(isinstance(v, str) and v.strip() for v in (slot_id, name, email)):
+        return error(400, "slot_id, name and email are required")
+    name = name.strip()
+    email = email.strip().lower()
+    if not EMAIL_RE.match(email):
+        return error(400, "email is not valid")
+
+    with LOCK:
+        if slot_id not in SLOTS:
+            return error(404, "slot not found")
+        if parse_dt(SLOTS[slot_id]["start"]) <= datetime.now(timezone.utc):
+            return error(400, "slot has already started")
+        booking = {
+            "id": str(uuid.uuid4()),
+            "slot_id": slot_id,
+            "name": name,
+            "email": email,
+            "status": "confirmed",
+            "created_at": now_iso(),
+        }
+        BOOKINGS[booking["id"]] = booking
+    return JSONResponse(booking, status_code=201)
+
+
+@app.get("/", include_in_schema=False)
+async def home():
+    html = (Path(__file__).parent / "index.html").read_text(encoding="utf-8")
+    return HTMLResponse(html.replace('"__API_KEY__"', json.dumps(API_KEY)))
+
+
+@app.get("/bookings/{booking_id}")
+async def get_booking(booking_id: str):
+    with LOCK:
+        booking = BOOKINGS.get(booking_id)
+    if booking is None:
+        return error(404, "booking not found")
+    return booking
