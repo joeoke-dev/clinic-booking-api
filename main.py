@@ -1,26 +1,38 @@
-"""Clinic booking API - Levels 1-2.
+"""Clinic booking API - Levels 1-3 (Postgres storage).
 
 Endpoints (see koyaacademy.com/assessment-api):
-  POST /reset          replace all slots, delete all bookings
-  GET  /slots          list slots (optional ?provider=...)
-  POST /bookings       book a slot
-  GET  /bookings/{id}  look up a booking
+  POST   /reset          replace all slots, delete all bookings
+  GET    /slots          list slots (optional ?provider=...)
+  POST   /bookings       book a slot
+  GET    /bookings/{id}  look up a booking
+  DELETE /bookings/{id}  cancel a booking
+
+Environment variables (set both on Render):
+  API_KEY       the key clients must send in the X-API-Key header
+  DATABASE_URL  the Neon Postgres connection string
 """
 import hmac
 import json
+import logging
 import os
 import re
-import threading
 import uuid
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, Request
+from fastapi.concurrency import run_in_threadpool
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.security import APIKeyHeader
+from psycopg.errors import ForeignKeyViolation, UniqueViolation
+from psycopg.rows import dict_row
+from psycopg_pool import ConnectionPool
 from starlette.exceptions import HTTPException as StarletteHTTPException
+
+log = logging.getLogger("clinic")
 
 # ---------------------------------------------------------------- auth (Level 2)
 # Set API_KEY as an environment variable on Render. The default is for local testing only.
@@ -36,9 +48,63 @@ def require_key(request: Request, key: str = Depends(api_key_header)):
         raise StarletteHTTPException(401, "missing or invalid API key")
 
 
-app = FastAPI(title="Clinic booking API", dependencies=[Depends(require_key)])
+# ---------------------------------------------------------------- database
+DATABASE_URL = os.environ.get("DATABASE_URL")
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL is not set. Paste your Neon connection string into it.")
 
-# The web page lives on a different URL, so the browser needs CORS headers.
+pool = ConnectionPool(
+    DATABASE_URL,
+    min_size=1,
+    max_size=10,
+    open=False,
+    check=ConnectionPool.check_connection,  # drop connections Neon closed while idle
+    kwargs={"row_factory": dict_row, "prepare_threshold": None},
+)
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS slots (
+    id          text PRIMARY KEY,
+    provider    text,
+    start_time  text,
+    end_time    text,
+    start_at    timestamptz
+);
+CREATE TABLE IF NOT EXISTS bookings (
+    seq         bigserial,
+    id          text PRIMARY KEY,
+    slot_id     text NOT NULL REFERENCES slots(id) ON DELETE CASCADE,
+    name        text NOT NULL,
+    email       text NOT NULL,
+    status      text NOT NULL,
+    created_at  text NOT NULL
+);
+-- The key to Level 3: a slot can have at most ONE confirmed booking.
+-- The database enforces this, so it holds even for simultaneous requests.
+CREATE UNIQUE INDEX IF NOT EXISTS one_confirmed_booking_per_slot
+    ON bookings (slot_id) WHERE status = 'confirmed';
+CREATE INDEX IF NOT EXISTS bookings_email_idx ON bookings (email, seq);
+"""
+
+BOOKING_COLS = "id, slot_id, name, email, status, created_at"
+
+
+@asynccontextmanager
+async def lifespan(app):
+    pool.open(wait=True)
+    with pool.connection() as conn:
+        conn.execute(SCHEMA)
+    yield
+    pool.close()
+
+
+app = FastAPI(
+    title="Clinic booking API",
+    dependencies=[Depends(require_key)],
+    lifespan=lifespan,
+)
+
+# Lets a page on another URL call the API from the browser.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -46,12 +112,6 @@ app.add_middleware(
     allow_headers=["*"],
     expose_headers=["Retry-After"],
 )
-
-# ---------------------------------------------------------------- storage
-# In-memory for now. We move this to a database at Level 3.
-LOCK = threading.Lock()
-SLOTS = {}     # slot id -> {"id", "provider", "start", "end"}
-BOOKINGS = {}  # booking id -> booking dict
 
 
 # ---------------------------------------------------------------- helpers
@@ -64,7 +124,7 @@ def now_iso():
 
 
 def parse_dt(value):
-    """Parse an ISO timestamp to an aware UTC datetime (for sorting)."""
+    """Parse an ISO timestamp to an aware UTC datetime. Unreadable values sort last."""
     try:
         dt = datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
         if dt.tzinfo is None:
@@ -77,13 +137,6 @@ def parse_dt(value):
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 
-def is_booked(slot_id):
-    return any(
-        b["slot_id"] == slot_id and b["status"] == "confirmed"
-        for b in BOOKINGS.values()
-    )
-
-
 async def read_json(request: Request):
     """Return the parsed JSON body, or None if it isn't a JSON object."""
     try:
@@ -91,6 +144,84 @@ async def read_json(request: Request):
     except Exception:
         return None
     return body if isinstance(body, dict) else None
+
+
+# ---------------------------------------------------------------- database functions
+# These are plain (blocking) functions; the routes run them in a thread pool.
+def db_reset(slot_rows):
+    with pool.connection() as conn:
+        conn.execute("DELETE FROM bookings")
+        conn.execute("DELETE FROM slots")
+        if slot_rows:
+            with conn.cursor() as cur:
+                cur.executemany(
+                    "INSERT INTO slots (id, provider, start_time, end_time, start_at)"
+                    " VALUES (%s, %s, %s, %s, %s)",
+                    slot_rows,
+                )
+
+
+def db_list_slots(provider):
+    sql = (
+        'SELECT s.id, s.provider, s.start_time AS "start", s.end_time AS "end",'
+        " NOT EXISTS (SELECT 1 FROM bookings b"
+        "             WHERE b.slot_id = s.id AND b.status = 'confirmed') AS available"
+        " FROM slots s"
+    )
+    params = ()
+    if provider is not None:
+        sql += " WHERE s.provider = %s"
+        params = (provider,)
+    sql += " ORDER BY s.start_at, s.id"
+    with pool.connection() as conn:
+        return conn.execute(sql, params).fetchall()
+
+
+def db_create_booking(slot_id, name, email):
+    """Returns (outcome, booking). outcome: ok | not_found | started | taken."""
+    with pool.connection() as conn:
+        slot = conn.execute("SELECT start_at FROM slots WHERE id = %s", (slot_id,)).fetchone()
+        if slot is None:
+            return "not_found", None
+        if slot["start_at"] <= datetime.now(timezone.utc):
+            return "started", None
+        try:
+            booking = conn.execute(
+                "INSERT INTO bookings (id, slot_id, name, email, status, created_at)"
+                f" VALUES (%s, %s, %s, %s, 'confirmed', %s) RETURNING {BOOKING_COLS}",
+                (str(uuid.uuid4()), slot_id, name, email, now_iso()),
+            ).fetchone()
+        except UniqueViolation:  # someone else already holds this slot
+            conn.rollback()
+            return "taken", None
+        except ForeignKeyViolation:  # slot was removed by a /reset in the meantime
+            conn.rollback()
+            return "not_found", None
+    return "ok", booking
+
+
+def db_get_booking(booking_id):
+    with pool.connection() as conn:
+        return conn.execute(
+            f"SELECT {BOOKING_COLS} FROM bookings WHERE id = %s", (booking_id,)
+        ).fetchone()
+
+
+def db_cancel_booking(booking_id):
+    """Returns (outcome, booking). outcome: ok | not_found | already."""
+    with pool.connection() as conn:
+        row = conn.execute(
+            "SELECT status FROM bookings WHERE id = %s FOR UPDATE", (booking_id,)
+        ).fetchone()
+        if row is None:
+            return "not_found", None
+        if row["status"] == "cancelled":
+            return "already", None
+        booking = conn.execute(
+            f"UPDATE bookings SET status = 'cancelled' WHERE id = %s RETURNING {BOOKING_COLS}",
+            (booking_id,),
+        ).fetchone()
+    return "ok", booking
 
 
 # ---------------------------------------------------------------- errors
@@ -103,6 +234,12 @@ async def http_error(request, exc):
 @app.exception_handler(RequestValidationError)
 async def validation_error(request, exc):
     return error(400, "invalid request")
+
+
+@app.exception_handler(Exception)
+async def unexpected_error(request, exc):
+    log.exception("unexpected error")
+    return error(500, "internal server error")
 
 
 # ---------------------------------------------------------------- routes
@@ -130,33 +267,26 @@ async def reset(request: Request):
     if body is None or not isinstance(body.get("slots"), list):
         return error(400, "body must be an object with a 'slots' list")
 
-    new_slots = {}
+    rows = {}
     for s in body["slots"]:
         if not isinstance(s, dict) or not s.get("id"):
             return error(400, "each slot needs an id")
-        new_slots[str(s["id"])] = {
-            "id": str(s["id"]),
-            "provider": s.get("provider"),
-            "start": s.get("start"),
-            "end": s.get("end"),
-        }
+        sid = str(s["id"])
+        rows[sid] = (
+            sid,
+            s.get("provider"),
+            None if s.get("start") is None else str(s["start"]),
+            None if s.get("end") is None else str(s["end"]),
+            parse_dt(s.get("start")),
+        )
 
-    with LOCK:
-        SLOTS.clear()
-        SLOTS.update(new_slots)
-        BOOKINGS.clear()
+    await run_in_threadpool(db_reset, list(rows.values()))
     return {"status": "ok"}
 
 
 @app.get("/slots")
 async def list_slots(provider: str = None):
-    with LOCK:
-        slots = [
-            {**s, "available": not is_booked(s["id"])}
-            for s in SLOTS.values()
-            if provider is None or s["provider"] == provider
-        ]
-    slots.sort(key=lambda s: parse_dt(s["start"]))
+    slots = await run_in_threadpool(db_list_slots, provider)
     return {"slots": slots}
 
 
@@ -176,20 +306,13 @@ async def create_booking(request: Request):
     if not EMAIL_RE.match(email):
         return error(400, "email is not valid")
 
-    with LOCK:
-        if slot_id not in SLOTS:
-            return error(404, "slot not found")
-        if parse_dt(SLOTS[slot_id]["start"]) <= datetime.now(timezone.utc):
-            return error(400, "slot has already started")
-        booking = {
-            "id": str(uuid.uuid4()),
-            "slot_id": slot_id,
-            "name": name,
-            "email": email,
-            "status": "confirmed",
-            "created_at": now_iso(),
-        }
-        BOOKINGS[booking["id"]] = booking
+    outcome, booking = await run_in_threadpool(db_create_booking, slot_id, name, email)
+    if outcome == "not_found":
+        return error(404, "slot not found")
+    if outcome == "started":
+        return error(400, "slot has already started")
+    if outcome == "taken":
+        return error(409, "slot is already booked")
     return JSONResponse(booking, status_code=201)
 
 
@@ -201,8 +324,17 @@ async def home():
 
 @app.get("/bookings/{booking_id}")
 async def get_booking(booking_id: str):
-    with LOCK:
-        booking = BOOKINGS.get(booking_id)
+    booking = await run_in_threadpool(db_get_booking, booking_id)
     if booking is None:
         return error(404, "booking not found")
+    return booking
+
+
+@app.delete("/bookings/{booking_id}")
+async def cancel_booking(booking_id: str):
+    outcome, booking = await run_in_threadpool(db_cancel_booking, booking_id)
+    if outcome == "not_found":
+        return error(404, "booking not found")
+    if outcome == "already":
+        return error(409, "booking is already cancelled")
     return booking
