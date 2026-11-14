@@ -1,4 +1,4 @@
-"""Clinic booking API - Levels 1-4 (Postgres storage).
+"""Clinic booking API - Levels 1-5 (Postgres storage).
 
 Endpoints (see koyaacademy.com/assessment-api):
   POST   /reset          replace all slots, delete all bookings
@@ -17,8 +17,11 @@ import hashlib
 import hmac
 import json
 import logging
+import math
 import os
 import re
+import threading
+import time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -142,6 +145,37 @@ def parse_dt(value):
         return dt.astimezone(timezone.utc)
     except (ValueError, TypeError):
         return datetime.max.replace(tzinfo=timezone.utc)
+
+
+# ---------------------------------------------------------------- rate limit (Level 5)
+# At most RATE_LIMIT booking attempts per email in any RATE_WINDOW seconds.
+# Failed attempts count too. Attempts that are rejected with 429 are not recorded.
+RATE_LIMIT = 5
+RATE_WINDOW = 60.0
+ATTEMPTS = {}  # email -> list of attempt times (time.monotonic())
+RATE_LOCK = threading.Lock()
+
+
+def check_rate_limit(email):
+    """Record this attempt. Returns None if allowed, or whole seconds to wait if not."""
+    now = time.monotonic()
+    with RATE_LOCK:
+        recent = [t for t in ATTEMPTS.get(email, []) if now - t < RATE_WINDOW]
+        if len(recent) >= RATE_LIMIT:
+            ATTEMPTS[email] = recent
+            # wait until the oldest attempt in the window drops out
+            return max(1, math.ceil(recent[0] + RATE_WINDOW - now))
+        recent.append(now)
+        ATTEMPTS[email] = recent
+        if len(ATTEMPTS) > 5000:  # tidy up emails that haven't been seen for a minute
+            for k in [k for k, v in ATTEMPTS.items() if not v or now - v[-1] >= RATE_WINDOW]:
+                del ATTEMPTS[k]
+    return None
+
+
+def clear_rate_limits():
+    with RATE_LOCK:
+        ATTEMPTS.clear()
 
 
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
@@ -348,6 +382,7 @@ async def reset(request: Request):
         )
 
     await run_in_threadpool(db_reset, list(rows.values()))
+    clear_rate_limits()
     return {"status": "ok"}
 
 
@@ -369,6 +404,17 @@ async def create_booking(
     slot_id = body.get("slot_id")
     name = body.get("name")
     email = body.get("email")
+
+    # Level 5: count every attempt for this email (even ones that fail below).
+    if isinstance(email, str) and email.strip():
+        wait = check_rate_limit(email.strip().lower())
+        if wait is not None:
+            return error(
+                429,
+                "too many booking attempts for this email, try again later",
+                headers={"Retry-After": str(wait)},
+            )
+
     if not all(isinstance(v, str) and v.strip() for v in (slot_id, name, email)):
         return error(400, "slot_id, name and email are required")
     name = name.strip()

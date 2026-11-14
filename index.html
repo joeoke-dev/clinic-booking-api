@@ -172,6 +172,10 @@
         headers: headers({ "Idempotency-Key": keyFor(selected.id, name, email) }),
         body: JSON.stringify({ slot_id: selected.id, name, email }),
       });
+      if (res.status === 429) {
+        const wait = res.headers.get("Retry-After");
+        throw new Error("Too many attempts for this email. Please try again in " + (wait || "a few") + " seconds.");
+      }
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "Booking failed");
       pending = { sig: "", key: "" };
