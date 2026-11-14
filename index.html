@@ -87,6 +87,19 @@
 
   let selected = null;
 
+  // One key per booking attempt: a retry of the same details reuses it, so it can never double-book.
+  let pending = { sig: "", key: "" };
+  function newKey() {
+    return (window.crypto && crypto.randomUUID)
+      ? crypto.randomUUID()
+      : "k-" + Date.now() + "-" + Math.random().toString(16).slice(2);
+  }
+  function keyFor(slotId, name, email) {
+    const sig = JSON.stringify([slotId, name, email.toLowerCase()]);
+    if (pending.sig !== sig) pending = { sig, key: newKey() };
+    return pending.key;
+  }
+
   function fmt(iso) {
     const d = new Date(iso);
     return isNaN(d) ? String(iso) : d.toLocaleString([], { dateStyle: "medium", timeStyle: "short" });
@@ -156,11 +169,12 @@
     try {
       const res = await fetch("/bookings", {
         method: "POST",
-        headers: headers(),
+        headers: headers({ "Idempotency-Key": keyFor(selected.id, name, email) }),
         body: JSON.stringify({ slot_id: selected.id, name, email }),
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "Booking failed");
+      pending = { sig: "", key: "" };
       showConfirmation(data);
       formCard.hidden = true;
       nameEl.value = "";

@@ -1,9 +1,10 @@
-"""Clinic booking API - Levels 1-3 (Postgres storage).
+"""Clinic booking API - Levels 1-4 (Postgres storage).
 
 Endpoints (see koyaacademy.com/assessment-api):
   POST   /reset          replace all slots, delete all bookings
   GET    /slots          list slots (optional ?provider=...)
   POST   /bookings       book a slot
+  GET    /bookings       list a person's bookings (?email=...&limit=...&cursor=...)
   GET    /bookings/{id}  look up a booking
   DELETE /bookings/{id}  cancel a booking
 
@@ -11,6 +12,8 @@ Environment variables (set both on Render):
   API_KEY       the key clients must send in the X-API-Key header
   DATABASE_URL  the Neon Postgres connection string
 """
+import base64
+import hashlib
 import hmac
 import json
 import logging
@@ -21,7 +24,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, Request
+from fastapi import Depends, FastAPI, Header, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
@@ -84,6 +87,13 @@ CREATE TABLE IF NOT EXISTS bookings (
 CREATE UNIQUE INDEX IF NOT EXISTS one_confirmed_booking_per_slot
     ON bookings (slot_id) WHERE status = 'confirmed';
 CREATE INDEX IF NOT EXISTS bookings_email_idx ON bookings (email, seq);
+-- Level 4: remembers the response for each Idempotency-Key.
+CREATE TABLE IF NOT EXISTS idempotency_keys (
+    key          text PRIMARY KEY,
+    body_hash    text NOT NULL,
+    status_code  integer,
+    response     text
+);
 """
 
 BOOKING_COLS = "id, slot_id, name, email, status, created_at"
@@ -150,6 +160,7 @@ async def read_json(request: Request):
 # These are plain (blocking) functions; the routes run them in a thread pool.
 def db_reset(slot_rows):
     with pool.connection() as conn:
+        conn.execute("DELETE FROM idempotency_keys")
         conn.execute("DELETE FROM bookings")
         conn.execute("DELETE FROM slots")
         if slot_rows:
@@ -177,27 +188,83 @@ def db_list_slots(provider):
         return conn.execute(sql, params).fetchall()
 
 
-def db_create_booking(slot_id, name, email):
-    """Returns (outcome, booking). outcome: ok | not_found | started | taken."""
-    with pool.connection() as conn:
-        slot = conn.execute("SELECT start_at FROM slots WHERE id = %s", (slot_id,)).fetchone()
-        if slot is None:
-            return "not_found", None
-        if slot["start_at"] <= datetime.now(timezone.utc):
-            return "started", None
-        try:
+def _try_book(conn, slot_id, name, email):
+    """Attempt the booking. Returns (status_code, payload)."""
+    slot = conn.execute("SELECT start_at FROM slots WHERE id = %s", (slot_id,)).fetchone()
+    if slot is None:
+        return 404, {"error": "slot not found"}
+    if slot["start_at"] <= datetime.now(timezone.utc):
+        return 400, {"error": "slot has already started"}
+    try:
+        with conn.transaction():  # a savepoint: a failed insert doesn't abort the outer transaction
             booking = conn.execute(
                 "INSERT INTO bookings (id, slot_id, name, email, status, created_at)"
                 f" VALUES (%s, %s, %s, %s, 'confirmed', %s) RETURNING {BOOKING_COLS}",
                 (str(uuid.uuid4()), slot_id, name, email, now_iso()),
             ).fetchone()
-        except UniqueViolation:  # someone else already holds this slot
-            conn.rollback()
-            return "taken", None
-        except ForeignKeyViolation:  # slot was removed by a /reset in the meantime
-            conn.rollback()
-            return "not_found", None
-    return "ok", booking
+    except UniqueViolation:  # someone else already holds this slot
+        return 409, {"error": "slot is already booked"}
+    except ForeignKeyViolation:  # slot was removed by a /reset in the meantime
+        return 404, {"error": "slot not found"}
+    return 201, booking
+
+
+def db_create_booking(slot_id, name, email, idem_key):
+    """Returns (status_code, payload).
+
+    With an idempotency key, the first request claims the key and saves its response.
+    A repeat of the same request gets that saved response back and creates nothing new.
+    """
+    body_hash = hashlib.sha256(json.dumps([slot_id, name, email]).encode()).hexdigest()
+    with pool.connection() as conn:
+        if idem_key:
+            # If another request holds this key right now, this INSERT waits for it to finish.
+            claimed = conn.execute(
+                "INSERT INTO idempotency_keys (key, body_hash) VALUES (%s, %s)"
+                " ON CONFLICT (key) DO NOTHING RETURNING key",
+                (idem_key, body_hash),
+            ).fetchone()
+            if claimed is None:
+                saved = conn.execute(
+                    "SELECT body_hash, status_code, response FROM idempotency_keys WHERE key = %s",
+                    (idem_key,),
+                ).fetchone()
+                if saved is None or saved["status_code"] is None:
+                    return 409, {"error": "a request with this Idempotency-Key is still in progress"}
+                if saved["body_hash"] != body_hash:
+                    return 422, {"error": "Idempotency-Key was already used with a different request body"}
+                return saved["status_code"], json.loads(saved["response"])
+
+        status, payload = _try_book(conn, slot_id, name, email)
+
+        if idem_key:
+            conn.execute(
+                "UPDATE idempotency_keys SET status_code = %s, response = %s WHERE key = %s",
+                (status, json.dumps(payload), idem_key),
+            )
+    return status, payload
+
+
+def encode_cursor(seq):
+    return base64.urlsafe_b64encode(str(seq).encode()).decode().rstrip("=")
+
+
+def decode_cursor(text):
+    """Return the sequence number inside a cursor, or None if the cursor is invalid."""
+    try:
+        value = int(base64.urlsafe_b64decode(text + "=" * (-len(text) % 4)).decode())
+    except Exception:
+        return None
+    return value if 0 <= value < 2**62 else None
+
+
+def db_list_bookings(email, limit, after_seq):
+    with pool.connection() as conn:
+        return conn.execute(
+            f"SELECT seq, {BOOKING_COLS} FROM bookings"
+            " WHERE email = %s AND seq > %s ORDER BY seq LIMIT %s",
+            (email, after_seq, limit + 1),
+        ).fetchall()
 
 
 def db_get_booking(booking_id):
@@ -291,7 +358,10 @@ async def list_slots(provider: str = None):
 
 
 @app.post("/bookings", openapi_extra=BOOKING_DOC)
-async def create_booking(request: Request):
+async def create_booking(
+    request: Request,
+    idempotency_key: str = Header(None, alias="Idempotency-Key"),
+):
     body = await read_json(request)
     if body is None:
         return error(400, "body must be a JSON object")
@@ -306,14 +376,42 @@ async def create_booking(request: Request):
     if not EMAIL_RE.match(email):
         return error(400, "email is not valid")
 
-    outcome, booking = await run_in_threadpool(db_create_booking, slot_id, name, email)
-    if outcome == "not_found":
-        return error(404, "slot not found")
-    if outcome == "started":
-        return error(400, "slot has already started")
-    if outcome == "taken":
-        return error(409, "slot is already booked")
-    return JSONResponse(booking, status_code=201)
+    key = idempotency_key.strip() if idempotency_key else None
+    if key and len(key) > 255:
+        return error(400, "Idempotency-Key is too long")
+
+    status, payload = await run_in_threadpool(db_create_booking, slot_id, name, email, key or None)
+    return JSONResponse(payload, status_code=status)
+
+
+@app.get("/bookings")
+async def list_bookings(email: str = None, limit: str = None, cursor: str = None):
+    if email is None or not email.strip():
+        return error(400, "email is required")
+    email = email.strip().lower()
+
+    if limit is None or limit.strip() == "":
+        n = 10
+    else:
+        if not re.fullmatch(r"-?[0-9]+", limit.strip()):
+            return error(400, "limit must be a whole number from 1 to 50")
+        n = int(limit.strip())
+        if not 1 <= n <= 50:
+            return error(400, "limit must be a whole number from 1 to 50")
+
+    after = 0
+    if cursor is not None and cursor.strip() != "":
+        after = decode_cursor(cursor.strip())
+        if after is None:
+            return error(400, "invalid cursor")
+
+    rows = await run_in_threadpool(db_list_bookings, email, n, after)
+    next_cursor = None
+    if len(rows) > n:  # we fetched one extra row to learn there is another page
+        rows = rows[:n]
+        next_cursor = encode_cursor(rows[-1]["seq"])
+    bookings = [{k: v for k, v in r.items() if k != "seq"} for r in rows]
+    return {"bookings": bookings, "next_cursor": next_cursor}
 
 
 @app.get("/", include_in_schema=False)
