@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Clinic appointments</title>
+<style>
+  :root { --bg:#f6f7f9; --card:#fff; --text:#1c2330; --muted:#667085; --line:#e3e6eb; --accent:#0b6e4f; --danger:#b42318; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#12161c; --card:#1b212a; --text:#e8ecf2; --muted:#9aa4b2; --line:#2b3340; --accent:#3ecf8e; --danger:#ff8a80; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: system-ui, -apple-system, "Segoe UI", sans-serif; background:var(--bg); color:var(--text); }
+  main { max-width: 720px; margin: 0 auto; padding: 24px 16px 64px; }
+  h1 { font-size: 1.5rem; margin: 0 0 4px; }
+  h2 { font-size: 1.1rem; margin: 0 0 12px; }
+  p.sub { color: var(--muted); margin: 0 0 24px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 16px; margin-bottom: 16px; }
+  .slot { display:flex; justify-content:space-between; align-items:center; gap:12px; padding:12px 0; border-top:1px solid var(--line); }
+  .slot:first-child { border-top: 0; }
+  .slot .when { font-weight: 600; }
+  .slot .who { color: var(--muted); font-size: .9rem; }
+  .taken { color: var(--muted); font-size: .9rem; }
+  button { font: inherit; cursor: pointer; border: 0; border-radius: 8px; padding: 8px 14px; background: var(--accent); color: #fff; }
+  button.secondary { background: transparent; color: var(--text); border: 1px solid var(--line); }
+  button:disabled { opacity: .6; cursor: not-allowed; }
+  label { display:block; font-size:.9rem; margin: 10px 0 4px; }
+  input { font: inherit; width:100%; padding:9px 10px; border:1px solid var(--line); border-radius:8px; background:var(--bg); color:var(--text); }
+  .row { display:flex; gap:8px; margin-top:14px; }
+  .error { color: var(--danger); margin-top: 10px; }
+  .ok { border-color: var(--accent); }
+  dl { margin: 8px 0 0; display:grid; grid-template-columns: max-content 1fr; gap: 4px 14px; }
+  dt { color: var(--muted); }
+  dd { margin: 0; word-break: break-all; }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Book an appointment</h1>
+  <p class="sub">Pick an available slot, enter your details, and confirm. Times are shown in your local time.</p>
+
+  <section class="card">
+    <h2>Available slots</h2>
+    <div id="slots" aria-live="polite">Loading…</div>
+  </section>
+
+  <section class="card" id="form-card" hidden>
+    <h2>Your details</h2>
+    <div id="chosen"></div>
+    <label for="name">Full name</label>
+    <input id="name" autocomplete="name">
+    <label for="email">Email</label>
+    <input id="email" type="email" autocomplete="email">
+    <div class="row">
+      <button id="book">Confirm booking</button>
+      <button id="cancel-form" class="secondary">Cancel</button>
+    </div>
+    <div id="form-error" class="error" role="alert"></div>
+  </section>
+
+  <section class="card ok" id="confirmation" hidden>
+    <h2>Booking confirmed</h2>
+    <dl id="conf-details"></dl>
+  </section>
+</main>
+
+<script>
+  // Level 2 will fill this in. Every request already sends the header via headers().
+  const API_KEY = "";
+
+  function headers(extra) {
+    const h = { "Content-Type": "application/json", ...(extra || {}) };
+    if (API_KEY) h["X-API-Key"] = API_KEY;
+    return h;
+  }
+
+  const slotsEl = document.getElementById("slots");
+  const formCard = document.getElementById("form-card");
+  const chosenEl = document.getElementById("chosen");
+  const nameEl = document.getElementById("name");
+  const emailEl = document.getElementById("email");
+  const bookBtn = document.getElementById("book");
+  const formError = document.getElementById("form-error");
+  const confirmation = document.getElementById("confirmation");
+  const confDetails = document.getElementById("conf-details");
+
+  let selected = null;
+
+  function fmt(iso) {
+    const d = new Date(iso);
+    return isNaN(d) ? String(iso) : d.toLocaleString([], { dateStyle: "medium", timeStyle: "short" });
+  }
+
+  async function loadSlots() {
+    try {
+      const res = await fetch("/slots", { headers: headers() });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "Could not load slots");
+      renderSlots(data.slots);
+    } catch (e) {
+      slotsEl.textContent = e.message;
+    }
+  }
+
+  function renderSlots(slots) {
+    slotsEl.textContent = "";
+    if (!slots.length) { slotsEl.textContent = "No slots available right now."; return; }
+    for (const s of slots) {
+      const row = document.createElement("div");
+      row.className = "slot";
+      const info = document.createElement("div");
+      const when = document.createElement("div");
+      when.className = "when";
+      when.textContent = fmt(s.start) + " – " + new Date(s.end).toLocaleTimeString([], { timeStyle: "short" });
+      const who = document.createElement("div");
+      who.className = "who";
+      who.textContent = s.provider;
+      info.append(when, who);
+      row.append(info);
+      if (s.available) {
+        const btn = document.createElement("button");
+        btn.textContent = "Book";
+        btn.addEventListener("click", () => choose(s));
+        row.append(btn);
+      } else {
+        const t = document.createElement("span");
+        t.className = "taken";
+        t.textContent = "Taken";
+        row.append(t);
+      }
+      slotsEl.append(row);
+    }
+  }
+
+  function choose(slot) {
+    selected = slot;
+    confirmation.hidden = true;
+    formError.textContent = "";
+    chosenEl.textContent = slot.provider + " · " + fmt(slot.start);
+    formCard.hidden = false;
+    nameEl.focus();
+  }
+
+  document.getElementById("cancel-form").addEventListener("click", () => {
+    formCard.hidden = true;
+    selected = null;
+  });
+
+  bookBtn.addEventListener("click", async () => {
+    formError.textContent = "";
+    const name = nameEl.value.trim();
+    const email = emailEl.value.trim();
+    if (!name || !email) { formError.textContent = "Please enter your name and email."; return; }
+    bookBtn.disabled = true;
+    try {
+      const res = await fetch("/bookings", {
+        method: "POST",
+        headers: headers(),
+        body: JSON.stringify({ slot_id: selected.id, name, email }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "Booking failed");
+      showConfirmation(data);
+      formCard.hidden = true;
+      nameEl.value = "";
+      emailEl.value = "";
+      loadSlots();
+    } catch (e) {
+      formError.textContent = e.message;
+    } finally {
+      bookBtn.disabled = false;
+    }
+  });
+
+  function showConfirmation(b) {
+    confDetails.textContent = "";
+    const rows = [
+      ["Booking ID", b.id],
+      ["Status", b.status],
+      ["Name", b.name],
+      ["Email", b.email],
+      ["Slot", b.slot_id],
+      ["Booked at", fmt(b.created_at)],
+    ];
+    for (const [k, v] of rows) {
+      const dt = document.createElement("dt"); dt.textContent = k;
+      const dd = document.createElement("dd"); dd.textContent = v;
+      confDetails.append(dt, dd);
+    }
+    confirmation.hidden = false;
+    confirmation.scrollIntoView({ behavior: "smooth" });
+  }
+
+  loadSlots();
+</script>
+</body>
+</html>
