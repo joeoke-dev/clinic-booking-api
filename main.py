@@ -1,4 +1,4 @@
-"""Clinic booking API - Level 1.
+"""Clinic booking API - Levels 1-2.
 
 Endpoints (see koyaacademy.com/assessment-api):
   POST /reset          replace all slots, delete all bookings
@@ -6,18 +6,37 @@ Endpoints (see koyaacademy.com/assessment-api):
   POST /bookings       book a slot
   GET  /bookings/{id}  look up a booking
 """
+import hmac
+import json
+import os
+import re
 import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.security import APIKeyHeader
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-app = FastAPI(title="Clinic booking API")
+# ---------------------------------------------------------------- auth (Level 2)
+# Set API_KEY as an environment variable on Render. The default is for local testing only.
+API_KEY = os.environ.get("API_KEY", "dev-key")
+api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+
+def require_key(request: Request, key: str = Depends(api_key_header)):
+    """Reject any request without the right X-API-Key (the web page itself is exempt)."""
+    if request.url.path == "/":
+        return
+    if not key or not hmac.compare_digest(key.encode(), API_KEY.encode()):
+        raise StarletteHTTPException(401, "missing or invalid API key")
+
+
+app = FastAPI(title="Clinic booking API", dependencies=[Depends(require_key)])
 
 # The web page lives on a different URL, so the browser needs CORS headers.
 app.add_middleware(
@@ -53,6 +72,9 @@ def parse_dt(value):
         return dt.astimezone(timezone.utc)
     except (ValueError, TypeError):
         return datetime.max.replace(tzinfo=timezone.utc)
+
+
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 
 def is_booked(slot_id):
@@ -149,15 +171,21 @@ async def create_booking(request: Request):
     email = body.get("email")
     if not all(isinstance(v, str) and v.strip() for v in (slot_id, name, email)):
         return error(400, "slot_id, name and email are required")
+    name = name.strip()
+    email = email.strip().lower()
+    if not EMAIL_RE.match(email):
+        return error(400, "email is not valid")
 
     with LOCK:
         if slot_id not in SLOTS:
             return error(404, "slot not found")
+        if parse_dt(SLOTS[slot_id]["start"]) <= datetime.now(timezone.utc):
+            return error(400, "slot has already started")
         booking = {
             "id": str(uuid.uuid4()),
             "slot_id": slot_id,
-            "name": name.strip(),
-            "email": email.strip().lower(),
+            "name": name,
+            "email": email,
             "status": "confirmed",
             "created_at": now_iso(),
         }
@@ -167,7 +195,8 @@ async def create_booking(request: Request):
 
 @app.get("/", include_in_schema=False)
 async def home():
-    return FileResponse(Path(__file__).parent / "index.html")
+    html = (Path(__file__).parent / "index.html").read_text(encoding="utf-8")
+    return HTMLResponse(html.replace('"__API_KEY__"', json.dumps(API_KEY)))
 
 
 @app.get("/bookings/{booking_id}")
